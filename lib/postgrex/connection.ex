@@ -3,7 +3,7 @@ defmodule Postgrex.Connection do
   Main API for Postgrex. This module handles the connection to postgres.
   """
 
-  use GenServer
+  @behaviour Connection
   alias Postgrex.Protocol
   alias Postgrex.Messages
   alias Postgrex.Types
@@ -43,16 +43,18 @@ defmodule Postgrex.Connection do
       |> Keyword.put_new(:password, System.get_env("PGPASSWORD"))
       |> Keyword.put_new(:hostname, System.get_env("PGHOST") || "localhost")
       |> Enum.reject(fn {_k,v} -> is_nil(v) end)
-    case GenServer.start_link(__MODULE__, []) do
-      {:ok, pid} ->
-        timeout = opts[:timeout] || @timeout
-        func = if opts[:async_connect], do: :cast, else: :call
-
-        case apply(GenServer, func, [pid, {:connect, opts}, timeout]) do
-          :ok -> {:ok, pid}
-          err -> {:error, err}
-        end
-      err -> err
+    if opts[:async_connect] do
+      Connection.start_link(__MODULE__, {Connection, :connect, opts})
+    else
+      case Connection.start_link(__MODULE__, {Connection, :noconnect}) do
+        {:ok, pid} ->
+          timeout = opts[:timeout] || @timeout
+          case Connection.call(pid, {:connect, opts}, timeout) do
+            :ok -> {:ok, pid}
+            err -> {:error, err}
+          end
+        err -> err
+      end
     end
   end
 
@@ -65,7 +67,7 @@ defmodule Postgrex.Connection do
   """
   @spec stop(pid, Keyword.t) :: :ok
   def stop(pid, opts \\ []) do
-    GenServer.call(pid, :stop, opts[:timeout] || @timeout)
+    Connection.call(pid, :stop, opts[:timeout] || @timeout)
   end
 
   @doc """
@@ -95,7 +97,7 @@ defmodule Postgrex.Connection do
   def query(pid, statement, params, opts \\ []) do
     message = {:query, statement, params}
     timeout = opts[:timeout] || @timeout
-    case GenServer.call(pid, message, timeout) do
+    case Connection.call(pid, message, timeout) do
       %Postgrex.Result{} = res ->
         {:ok, res}
       %Postgrex.Error{} = err ->
@@ -130,7 +132,7 @@ defmodule Postgrex.Connection do
   def listen(pid, channel, opts \\ []) do
     message = {:listen, channel, self()}
     timeout = opts[:timeout] || @timeout
-    case GenServer.call(pid, message, timeout) do
+    case Connection.call(pid, message, timeout) do
       ref when is_reference(ref)  -> {:ok, ref}
       %Postgrex.Error{} = err     -> {:error, err}
     end
@@ -159,7 +161,7 @@ defmodule Postgrex.Connection do
   def unlisten(pid, ref, opts \\ []) do
     message = {:unlisten, ref}
     timeout = opts[:timeout] || @timeout
-    case GenServer.call(pid, message, timeout) do
+    case Connection.call(pid, message, timeout) do
       :ok -> :ok
       %ArgumentError{} = err -> raise err
       %Postgrex.Error{} = err -> {:error, err}
@@ -187,21 +189,28 @@ defmodule Postgrex.Connection do
   """
   @spec parameters(pid, Keyword.t) :: map
   def parameters(pid, opts \\ []) do
-    GenServer.call(pid, :parameters, opts[:timeout] || @timeout)
+    Connection.call(pid, :parameters, opts[:timeout] || @timeout)
   end
 
   def rebootstrap(pid, opts \\ []) do
-    GenServer.call(pid, :rebootstrap, opts[:timeout] || @timeout)
+    Connection.call(pid, :rebootstrap, opts[:timeout] || @timeout)
   end
 
   ### GEN_SERVER CALLBACKS ###
 
   @doc false
-  def init([]) do
-    {:ok, %{sock: nil, tail: "", state: :ready, parameters: %{}, backend_key: nil,
-            rows: [], statement: nil, portal: nil, bootstrap: false, types: nil,
-            queue: :queue.new, opts: nil, extensions: nil, listeners: HashDict.new,
-            listener_channels: HashDict.new}}
+  def init({mod, :connect, opts}) do
+    {:connect, :init, init_state(&mod.reply/2, opts)}
+  end
+  def init({mod, :noconnect}) do
+    {:noconnect, init_state(&mod.reply/2, nil)}
+  end
+
+  defp init_state(reply, opts) do
+    %{sock: nil, tail: "", state: :ready, parameters: %{}, backend_key: nil,
+      rows: [], statement: nil, portal: nil, bootstrap: false, types: nil,
+      reply: reply, queue: :queue.new, opts: opts, extensions: nil,
+      listeners: HashDict.new, listener_channels: HashDict.new}
   end
 
   @doc false
@@ -215,13 +224,54 @@ defmodule Postgrex.Connection do
   end
 
   @doc false
+  def connect(info, %{opts: opts, queue: queue} = s) do
+    host       = Keyword.fetch!(opts, :hostname)
+    host       = if is_binary(host), do: String.to_char_list(host), else: host
+    port       = opts[:port] || 5432
+    timeout    = opts[:timeout] || @timeout
+    sock_opts  = [{:active, :once}, {:packet, :raw}, :binary] ++ (opts[:socket_options] || [])
+    extensions = (opts[:extensions] || []) ++ @default_extensions
+
+    from = if is_atom(info), do: nil, else: info
+    command = new_command({:connect, opts}, from)
+    queue = :queue.in(command, queue)
+    s = %{s | opts: opts, queue: queue, extensions: extensions}
+
+    case :gen_tcp.connect(host, port, sock_opts, timeout) do
+      {:ok, sock} ->
+        s = put_in(s.sock, {:gen_tcp, sock})
+        case startup(s) do
+          {:noreply, s} ->
+            {:ok, s}
+          {:stop, _, _} = stop ->
+            stop
+        end
+        {:error, reason} ->
+        error(%Postgrex.Error{message: "tcp connect: #{reason}"}, s)
+    end
+  end
+
+  defp startup(%{opts: opts} = s) do
+    if opts[:ssl] do
+      Protocol.startup_ssl(s)
+    else
+      Protocol.startup(s)
+    end
+  end
+
+  @doc false
+  def disconnect(reason, s) do
+    {:stop, reason, s}
+  end
+
+  @doc false
   def handle_call(:stop, from, s) do
-    reply(:ok, from)
+    reply(:ok, from, s)
     {:stop, :normal, s}
   end
 
   def handle_call({:connect, opts}, from, s) do
-    connect(opts, from, s)
+    {:connect, from, %{s | opts: opts}}
   end
 
   def handle_call(:parameters, _from, %{parameters: params} = s) do
@@ -245,10 +295,11 @@ defmodule Postgrex.Connection do
   end
 
   @doc false
-  def handle_cast({:connect, opts}, s) do
-    connect(opts, nil, s)
+  def handle_cast(cast, s) do
+    {:stop, {:bad_cast, cast}, s}
   end
 
+  @doc false
   def handle_info({:DOWN, ref, :process, _, _}, s) do
     s =
       case HashDict.fetch(s.listeners, ref) do
@@ -329,35 +380,13 @@ defmodule Postgrex.Connection do
     end
   end
 
+  @doc false
+  def code_change(_, s, _), do: {:ok, s}
+
+  @doc false
+  def terminate(_, _), do: :ok
+
   ### PRIVATE FUNCTIONS ###
-
-  defp connect(opts, from, %{queue: queue} = s) do
-    host       = Keyword.fetch!(opts, :hostname)
-    host       = if is_binary(host), do: String.to_char_list(host), else: host
-    port       = opts[:port] || 5432
-    timeout    = opts[:timeout] || @timeout
-    sock_opts  = [{:active, :once}, {:packet, :raw}, :binary] ++ (opts[:socket_options] || [])
-    extensions = (opts[:extensions] || []) ++ @default_extensions
-
-    command = new_command({:connect, opts}, from)
-    queue = :queue.in(command, queue)
-    s = %{s | opts: opts, queue: queue, extensions: extensions}
-
-    case :gen_tcp.connect(host, port, sock_opts, timeout) do
-      {:ok, sock} ->
-        s = put_in(s.sock, {:gen_tcp, sock})
-
-        if opts[:ssl] do
-          Protocol.startup_ssl(s)
-        else
-          Protocol.startup(s)
-        end
-
-      {:error, reason} ->
-        error(%Postgrex.Error{message: "tcp connect: #{reason}"}, s)
-    end
-  end
-
   defp command({:query, statement, _params}, s) do
     Protocol.send_query(statement, s)
   end

@@ -3,26 +3,26 @@ defmodule Postgrex.Utils do
 
   def error(error, s) do
     reply(error, s)
-    {:stop, error, s}
+    {:disconnect, error, s}
   end
 
-  def reply(reply, %{queue: queue}) do
+  def reply(response, %{queue: queue, reply: reply}) do
     case :queue.out(queue) do
       {:empty, _queue} ->
         false
       {{:value, %{from: nil}}, _queue} ->
         false
       {{:value, %{reply: :no_reply, from: from}}, _queue} ->
-        GenServer.reply(from, reply)
+        reply.(from, response)
         true
-      {{:value, %{reply: {:reply, reply}, from: from}}, _queue} ->
-        GenServer.reply(from, reply)
+      {{:value, %{reply: {:reply, response}, from: from}}, _queue} ->
+        reply.(from, response)
         true
     end
   end
 
-  def reply(reply, {_, _} = from) do
-    GenServer.reply(from, reply)
+  def reply(response, {_, _} = from, %{reply: reply}) do
+    reply.(from, response)
     true
   end
 

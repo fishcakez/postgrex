@@ -25,7 +25,8 @@ defmodule Postgrex.Mixfile do
   defp deps do
     [{:ex_doc, only: :dev},
      {:earmark, only: :dev},
-     {:decimal, "~> 1.0"}]
+     {:decimal, "~> 1.0"},
+     {:connection, "~> 0.0.1", github: "fishcakez/connection"}]
   end
 
   defp description do

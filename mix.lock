@@ -1,3 +1,4 @@
-%{"decimal": {:hex, :decimal, "1.1.0"},
+%{"connection": {:git, "git://github.com/fishcakez/connection.git", "f641261d9b1538472007c681139814f27768e35b", []},
+  "decimal": {:hex, :decimal, "1.1.0"},
   "earmark": {:hex, :earmark, "0.1.15"},
   "ex_doc": {:hex, :ex_doc, "0.7.2"}}
