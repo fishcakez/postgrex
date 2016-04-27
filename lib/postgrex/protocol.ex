@@ -6,6 +6,7 @@ defmodule Postgrex.Protocol do
   import Postgrex.Messages
   import Postgrex.BinaryUtils
   require Logger
+  @behaviour DBConnection
 
   @timeout 5000
   @sock_opts [packet: :raw, mode: :binary, active: false]
@@ -85,7 +86,7 @@ defmodule Postgrex.Protocol do
   @spec ping(state) ::
     {:ok, state} | {:disconnect, Postgrex.Error.t, state}
   def ping(%{buffer: buffer} = s) do
-    status = %{notify: notify([]), sync: :sync}
+    status = %{notify: notify([])}
     s = %{s | buffer: nil}
     case buffer do
       :active_once ->
@@ -124,16 +125,16 @@ defmodule Postgrex.Protocol do
     reserved_error(query, s)
   end
   def handle_prepare(%Query{types: nil} = query, opts, %{queries: nil, buffer: buffer} = s) do
-    status = %{notify: notify(opts), sync: :sync, prepare: :parse_describe}
+    status = %{notify: notify(opts), prepare: :parse_describe}
     parse_describe_send(%{s | buffer: nil}, status, unnamed(query), buffer)
   end
   def handle_prepare(%Query{types: nil} = query, opts, %{buffer: buffer} = s) do
     case query_member?(s, query) do
       true ->
-        status = %{notify: notify(opts), sync: :sync, prepare: :describe}
+        status = %{notify: notify(opts), prepare: :describe}
         describe_send(%{s | buffer: nil}, status, query, buffer)
       false ->
-        status = %{notify: notify(opts), sync: :sync, prepare: :parse_describe}
+        status = %{notify: notify(opts), prepare: :parse_describe}
         parse_describe_send(%{s | buffer: nil}, status, query, buffer)
     end
   end
@@ -149,7 +150,19 @@ defmodule Postgrex.Protocol do
     {:error, ArgumentError.t, state} |
     {:error | :disconnect, Postgrex.Error.t, state}
   def handle_execute(%Query{} = query, params, opts, s) do
-    handle_execute(query, params, :sync, opts, s)
+   %{types: types, queries: queries, buffer: buffer} = s
+    status = %{notify: notify(opts), prepare: :parse_execute}
+    case query do
+      %Query{types: nil} ->
+        query_error(s, "query #{inspect query} has not been prepared")
+      %Query{types: ^types} when is_nil(queries) ->
+        query = unnamed(query)
+        parse_execute_send(%{s | buffer: nil}, status, query, params, buffer)
+      %Query{types: ^types} ->
+        execute_lookup(%{s | buffer: nil}, status, query, params, buffer)
+      %Query{} ->
+        query_error(s, "query #{inspect query} has invalid types for the connection")
+    end
   end
   @spec handle_execute(Postgrex.Parameters.t, nil, Keyword.t, state) ::
     {:ok, %{binary => binary}, state} |
@@ -162,21 +175,6 @@ defmodule Postgrex.Protocol do
       :error ->
         {:error, %Postgrex.Error{message: "parameters not available"}, s}
     end
-  end
-
-  @spec handle_execute_close(Postgrex.Query.t, list, Keyword.t, state) ::
-    {:ok, Postgrex.Result.t, state} |
-    {:error, ArgumentError.t, state} |
-    {:error | :disconnect, Postgrex.Error.t, state}
-  def handle_execute_close(%Query{name: @reserved_prefix <> _} = query, _, _, s) do
-    reserved_error(query, s)
-  end
-  def handle_execute_close(%Query{name: ""} = query, params, opts, s) do
-    # Do not need to close unnamed query as can be overridden.
-    handle_execute(query, params, :sync, opts, s)
-  end
-  def handle_execute_close(query, params, opts, s) do
-    handle_execute(query, params, :sync_close, opts, s)
   end
 
   @spec handle_close(Postgrex.Query.t, Keyword.t, state) ::
@@ -240,7 +238,7 @@ defmodule Postgrex.Protocol do
     {:ok, Postgrex.Result.t, state} |
     {:error | :disconnect, Postgrex.Error.t, state}
   def handle_simple(statement, opts, %{buffer: buffer} = s) do
-    status = %{notify: notify(opts), sync: :sync}
+    status = %{notify: notify(opts)}
     simple_send(%{s | buffer: nil}, status, statement, buffer)
   end
 
@@ -632,23 +630,6 @@ defmodule Postgrex.Protocol do
   end
 
   ## execute
-
-  defp handle_execute(query, params, sync, opts, s) do
-    %{types: types, queries: queries, buffer: buffer} = s
-    status = %{notify: notify(opts), sync: sync, prepare: :parse_execute}
-    case query do
-      %Query{types: nil} ->
-        query_error(s, "query #{inspect query} has not been prepared")
-      %Query{types: ^types} when is_nil(queries) ->
-        query = unnamed(query)
-        parse_execute_send(%{s | buffer: nil}, status, query, params, buffer)
-      %Query{types: ^types} ->
-        execute_lookup(%{s | buffer: nil}, status, query, params, buffer)
-      %Query{} ->
-        query_error(s, "query #{inspect query} has invalid types for the connection")
-    end
-  end
-
   defp query_error(s, msg) do
     {:error, ArgumentError.exception(msg), s}
   end
@@ -666,8 +647,8 @@ defmodule Postgrex.Protocol do
     %Query{param_formats: pfs, result_formats: rfs, name: name} = query
     msgs = [
       msg_bind(name_port: "", name_stat: name, param_formats: pfs, params: params, result_formats: rfs),
-      msg_execute(name_port: "", max_rows: 0) |
-      sync_msgs(status, name)]
+      msg_execute(name_port: "", max_rows: 0),
+      msg_sync()]
     case msg_send(s, msgs, buffer) do
       :ok ->
         bind_recv(s, status, query, buffer)
@@ -681,21 +662,14 @@ defmodule Postgrex.Protocol do
     msgs = [
       msg_parse(name: name, statement: statement, type_oids: []),
       msg_bind(name_port: "", name_stat: name, param_formats: pfs, params: params, result_formats: rfs),
-      msg_execute(name_port: "", max_rows: 0) |
-      sync_msgs(status, name)]
+      msg_execute(name_port: "", max_rows: 0),
+      msg_sync()]
     case msg_send(s, msgs, buffer) do
       :ok ->
         parse_recv(s, status, query, buffer)
       {:disconnect, _, _} = dis ->
         dis
     end
-  end
-
-  defp sync_msgs(%{sync: :sync_close}, name) do
-    [msg_sync(), msg_close(type: :statement, name: name), msg_flush()]
-  end
-  defp sync_msgs(_, _) do
-    [msg_sync()]
   end
 
   defp bind_recv(s, status, query, buffer) do
@@ -813,7 +787,7 @@ defmodule Postgrex.Protocol do
   end
   defp handle_transaction(name, postgres, cmd, opts, s) do
     %{connection_id: connection_id, buffer: buffer} = s
-    status = %{notify: notify(opts), sync: :sync}
+    status = %{notify: notify(opts)}
     res = %Postgrex.Result{command: cmd, connection_id: connection_id}
     transaction_send(%{s | buffer: nil}, status, name, postgres, res, buffer)
   end
@@ -874,7 +848,7 @@ defmodule Postgrex.Protocol do
 
   defp handle_savepoint(names, cmd, opts, s) do
    %{connection_id: connection_id, buffer: buffer} = s
-    status = %{notify: notify(opts), sync: :sync}
+    status = %{notify: notify(opts)}
     res = %Postgrex.Result{command: cmd, connection_id: connection_id}
     savepoint_send(%{s | buffer: nil}, status, names, res, buffer)
   end
@@ -1129,7 +1103,7 @@ defmodule Postgrex.Protocol do
   # Query has completed so ok to use state timeout as message should either be
   # buffer or in flight. sync_recv/5 used by simple queries so can't use
   # :infinity.
-  defp sync_recv(s, %{sync: sync} = status, query, result, buffer) do
+  defp sync_recv(s, status, query, result, buffer) do
     %{postgres: postgres, timeout: timeout} = s
     case msg_recv(s, timeout, buffer) do
       {:ok, msg_ready(status: :idle), buffer} when postgres == :transaction ->
@@ -1138,10 +1112,8 @@ defmodule Postgrex.Protocol do
         sync_error(s, :transaction, buffer)
       {:ok, msg_ready(status: :failed), buffer} when postgres == :idle ->
         sync_error(s, :failed, buffer)
-      {:ok, msg_ready(), buffer} when sync == :sync ->
+      {:ok, msg_ready(), buffer} ->
         ok(s, result, buffer)
-      {:ok, msg_ready(), buffer} when sync == :sync_close ->
-        close_recv(s, status, query, result, buffer)
       {:ok, msg, buffer} ->
         sync_recv(handle_msg(s, status, msg), status, query, result, buffer)
       {:disconnect, _, _} = dis ->
