@@ -91,6 +91,24 @@ defmodule Postgrex.Types do
   end
 
   @doc false
+  def cockroach_rows() do
+    [~w(16 bool boolsend boolrecv boolout boolin 0 0 {}),
+     ~w(17 bytea byteasend bytearecv byteaout byteain 0 0 {}),
+     ~w(20 int8 int8send int8recv int8out int8in 0 0 {}),
+     ~w(21 int2 int2send int2recv int2out int2in 0 0 {}),
+     ~w(23 int4 int4send int4recv int4out int4in 0 0 {}),
+     ~w(25 text textsend textrecv textout textin 0 0 {}),
+     ~w(700 float4 float4send float4recv float4out float4in 0 0 {}),
+     ~w(701 float8 float8send float8recv float8out float8in 0 0 {}),
+     ~w(1043 varchar varcharsend varcharrecv varcharout varcharin 0 0 {}),
+     ~w(1082 date date_send date_recv date_out date_in 0 0 {}),
+     ~w(1114 timestamp timestamp_send timestamp_recv timestamp_out timestamp_in 0 0 {}),
+     ~w(1184 timestamptz timestamptz_send timestamptz_recv timestamptz_out timestamptz_in 0 0 {}),
+     ~w(1186 interval interval_send interval_recv interval_out interval_in 0 0 {}),
+     ~w(1700 numeric numeric_send numeric_recv numeric_out numeric_in 0 0 {})]
+  end
+
+  @doc false
   def associate_extensions_with_types(table, extensions, extension_opts, types) do
     oid_types = Enum.into(types, Map.new, &{&1.oid, &1})
 

@@ -645,7 +645,7 @@ defmodule Postgrex.Protocol do
         build_types = if oids == [], do: :create, else: :update
         bootstrap_recv(s, %{status | build_types: build_types}, buffer)
       {:disconnect, err, s} ->
-        bootstrap_fail(s, err, status)
+        bootstrap_fail(s, status, err)
     end
   end
 
@@ -655,11 +655,11 @@ defmodule Postgrex.Protocol do
         bootstrap_recv(s, status, [], buffer)
       {:ok, msg_error(fields: fields), buffer} ->
         err = Postgrex.Error.exception(postgres: fields)
-        bootstrap_fail(s, err, status, buffer)
+        detect_backend(s, status, err, buffer)
       {:ok, msg, buffer} ->
         bootstrap_recv(handle_msg(s, status, msg), status, buffer)
       {:disconnect, err, s} ->
-        bootstrap_fail(s, err, status)
+        bootstrap_fail(s, status, err)
     end
   end
 
@@ -671,11 +671,11 @@ defmodule Postgrex.Protocol do
         bootstrap_types(s, status, rows, buffer)
       {:ok, msg_error(fields: fields), buffer} ->
         err = Postgrex.Error.exception(postgres: fields)
-        bootstrap_fail(s, err, status, buffer)
+        bootstrap_fail(s, status, err, buffer)
       {:ok, msg, buffer} ->
         bootstrap_recv(handle_msg(s, status, msg), status, rows, buffer)
       {:disconnect, err, s} ->
-        bootstrap_fail(s, err, status)
+        bootstrap_fail(s, status, err)
     end
   end
 
@@ -711,13 +711,80 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp bootstrap_fail(s, err, %{types_ref: ref}) do
+  defp bootstrap_fail(s, %{types_ref: ref}, err) do
     is_nil(ref) || Postgrex.TypeServer.fail(ref)
     {:disconnect, err, s}
   end
 
-  defp bootstrap_fail(s, err, status, buffer) do
-    bootstrap_fail(%{s | buffer: buffer}, err, status)
+  defp bootstrap_fail(s, status, err, buffer) do
+    bootstrap_fail(%{s | buffer: buffer}, status, err)
+  end
+
+  defp detect_backend(s, status, err, buffer) do
+    case msg_recv(s, :infinity, buffer) do
+      {:ok, msg_ready(status: :idle), buffer} ->
+        detect_send(s, status, err, buffer)
+      {:ok, msg_ready(status: postgres), buffer} ->
+        sync_error(s, postgres, buffer)
+      {:ok, msg, buffer} ->
+        detect_backend(handle_msg(s, status, msg), status, err, buffer)
+      {:disconnect, err, s} ->
+        bootstrap_fail(s, status, err)
+    end
+  end
+
+  defp detect_send(s, status, err, buffer) do
+    msg = msg_query(statement: "SELECT version()")
+    case msg_send(s, msg, buffer) do
+      :ok ->
+        detect_recv(s, status, err, buffer)
+      {:disconnect, err, s} ->
+        bootstrap_fail(s, status, err)
+    end
+  end
+
+  defp detect_recv(s, status, err, buffer) do
+    case msg_recv(s, :infinity, buffer) do
+      {:ok, msg_row_desc(), buffer} ->
+        detect_recv(s, status, err, [], buffer)
+      {:ok, msg_error(fields: fields), buffer} ->
+        err = Postgrex.Error.exception(postgres: fields)
+        bootstrap_fail(s, status, err, buffer)
+      {:ok, msg, buffer} ->
+        detect_recv(handle_msg(s, status, msg), status, err, buffer)
+      {:disconnect, err, s} ->
+        bootstrap_fail(s, status, err)
+    end
+  end
+
+  defp detect_recv(s, status, err, rows, buffer) do
+    case msg_recv(s, :infinity, buffer) do
+      {:ok, msg_data_row(values: values), buffer} ->
+        detect_recv(s, status, err, [row_decode(values) | rows], buffer)
+      {:ok, msg_command_complete(), buffer} ->
+        detect_types(s, status, err, rows, buffer)
+      {:ok, msg_error(fields: fields), buffer} ->
+        err = Postgrex.Error.exception(postgres: fields)
+        bootstrap_fail(s, status, err, buffer)
+      {:ok, msg, buffer} ->
+        detect_recv(handle_msg(s, status, msg), status, err, rows, buffer)
+      {:disconnect, err, s} ->
+        bootstrap_fail(s, status, err)
+    end
+  end
+
+  defp detect_types(s, status, _, [["CockroachDB" <> _]], buffer) do
+    bootstrap_cockroach(s, status, buffer)
+  end
+  defp detect_types(s, status, err, _, buffer) do
+    bootstrap_fail(s, status, err, buffer)
+  end
+
+  defp bootstrap_cockroach(s, %{build_types: :create} = status, buffer) do
+    bootstrap_types(s, status, Postgrex.Types.cockroach_rows(), buffer)
+  end
+  defp bootstrap_cockroach(s, %{build_types: :update} = status, buffer) do
+    bootstrap_types(s, status, [], buffer)
   end
 
   defp reserve_send(s, %{prepare: :unnamed}, buffer) do
