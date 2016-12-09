@@ -1716,6 +1716,7 @@ defmodule Postgrex.Protocol do
       {:ok, data} when is_list(buffer) ->
         msg_recv(s, timeout, IO.iodata_to_binary([buffer | data]))
       {:error, reason} ->
+        IO.inspect {more, buffer}
         disconnect(s, tag(mod), "recv", reason, IO.iodata_to_binary(buffer))
     end
   end
